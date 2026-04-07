@@ -13,6 +13,12 @@
 #include <util/delay.h>
 #include <stdint.h>
 
+// Misc declarations
+static void flash_led(uint8_t count_flash);
+
+/*
+ * ADC Related items
+ */
 // Set VCC_MV to match your board supply (5000 for 5V, 3300 for 3.3V).
 #ifndef VCC_MV
 #define VCC_MV 5000UL
@@ -21,15 +27,14 @@
 // Misc ADC constants
 #define ADC_MAX 1023UL
 
-/*
- * The threshold between light and dark. For the 5516 photocell
- *  with typical room lighting (1-2K light and 5-10K dark) 
- *  and the value of the resistors in the divider (3K to Vcc)
- *
- * For other photocells and/or other lighting conditions this will differ
- */
+// The threshold between light and dark. For the 5516 photocell
+//  with typical room lighting (1-2K light and 5-10K dark) 
+//  and the value of the resistors in the divider (3K to Vcc)
+//
+// For other photocells, resistors and/or other lighting conditions this voltage will differ
 #define THRESH_MV 2750UL		// The voltage between light and dark
 
+// The threshold in terms of counts (AVR has a 10 bit A/D
 #define	THRESHOLD	 ((uint16_t) ((THRESH_MV * ADC_MAX) / VCC_MV))
 
 // Perform a conversion on the ADC, here always PA3
@@ -43,13 +48,15 @@ static bool read_adc(void)
 	while (!(ADC0.INTFLAGS & ADC_RESRDY_bm))
 	    ;
 	uint16_t sample = ADC0.RES;		// Make sure all the bits are read
-	 
+	
+	ADC0.INTFLAGS = ADC_RESRDY_bm;	// clear the ready bit, may not be necessary here
+	
 	// true if the current analog value is above the threshold
 	return(sample > THRESHOLD);
 }
 
 /*
- * There is an AVR_controlled LED which is used for heartbeat and
+ * PA1 is an AVR_controlled LED which is used for heartbeat and
  *  diagnostic functions.
  */
 static void led_on(void) {
@@ -59,7 +66,7 @@ static void led_off(void) {
     PORTA.OUTSET = (1<<1);
 }
 
-#define	HALF_CYCLE	200
+#define	HALF_CYCLE	250
 static void flash_led(uint8_t count_flash) {
 	uint8_t i;
 	
@@ -223,18 +230,21 @@ static uint8_t dfplayer_read_resp(uint8_t *buf, uint8_t max_len, uint32_t timeou
 }
 
 /* 
- * Get DFPlayer status (send he Query_Status command)
+ * Get DFPlayer status (send the Query_Status command)
  *   In general, we expect to wait between queries but in some
  *   situations might not want the wait
  */
-static uint8_t dfplayer_get_status(uint32_t wait_ms) {
+static uint8_t dfplayer_get_status(uint8_t wait_tenths) {
 		uint8_t resp_buf[16];		// should only ever be 10 bytes...
+		uint8_t	i;
 
     // Query status to see when it's done playing or initializeing
     while(1) {
-			_delay_ms(wait_ms);
+			// _delay_ms() expects a compile time delay
+			for (i=wait_tenths; i > 0; --i)	_delay_ms(100);
+			
 	    dfplayer_send_cmd(QUERY_STATUS_CMD, 0x00, 0x00);		// status query
-
+	    
 	    // read response
 	    uint8_t n = dfplayer_read_resp(resp_buf, sizeof(resp_buf), 500);
 	   	if (n != RESP_SIZE)
@@ -244,15 +254,25 @@ static uint8_t dfplayer_get_status(uint32_t wait_ms) {
 	  }
 }
 
-// Pin initializations
+/*
+ * Initialize the pins, AVR, DFPlayer Mini
+ */
+ 
+// The default clock rate for the Tiny402 is 20MHz but nothing in this
+//  application really requires that speed. At least initially, anything
+//  less than 10 MHz causes the UART code to fail
+// Make sure that ADC clock rate is consistent with the setting here
+#define	PDIV_2	(0)																				// 10 MHz
+#define	PDIV_4	(CLKCTRL_PDIV_0_bm)												// 5 MHz
+#define	PDIV_16	(CLKCTRL_PDIV_0_bm | CLKCTRL_PDIV_1_bm)		// 1.25 MHz
 static void init_avr(void)
 {
     uint8_t	timeout;
     
-    // set clock rate to 20Mhz (assuming fuse 0x02 is set to 2)
-    //  This must match the compile-time variable
-		_PROTECTED_WRITE(CLKCTRL.MCLKCTRLB, 0); 
-		
+    // set clock rate to 10Mhz (assuming fuse 0x02 is set to 2)
+    //  -->> This must match the compile-time variable
+	  _PROTECTED_WRITE(CLKCTRL.MCLKCTRLB, CLKCTRL_PEN_bm | PDIV_2); 
+	
 		// Configure PA1 (LED) as output and drive it high initially
     PORTA.DIRSET = PIN1_bm;
     led_off();
@@ -264,17 +284,30 @@ static void init_avr(void)
     PORTA.DIRCLR = PIN2_bm;
     PORTA.PIN2CTRL = PORT_PULLUPEN_bm;
 
+    /*
+     * ADC setup
+     */
     // Ensure PA3 is input (analog)
     PORTA.DIRCLR = PIN3_bm;
+    
+    // Disable digital input buffer
+    //  This also disables the pullup which would be enabled wth the PORT_PULLUPEN_bm bit
+    PORTA.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
 
-    // ADC setup:
-    // - Reference: VDD (VDD as ADC reference)
-    // - Prescaler: DIV4 (adjust if needed)
-    ADC0.CTRLC = ADC_PRESC_DIV4_gc | ADC_REFSEL_VDDREF_gc;
-    // Select PA3 as ADC positive input
+    // Select PA3 as ADC input
     ADC0.MUXPOS = ADC_MUXPOS_AIN3_gc;
-    // Enable ADC
-    ADC0.CTRLA = ADC_ENABLE_bm;
+    // Enable ADC, set for 10 bit resolution
+    ADC0.CTRLA = ADC_ENABLE_bm | ADC_RESSEL_10BIT_gc;
+    // Set for single sample mode at this time
+    ADC0.CTRLB = ADC_SAMPNUM_ACC1_gc;
+    // Set Reference to VDD
+    // Set Clock Prescaler to divide by 16
+    //   Per the datasheet the ADC requires an input clock frequency between
+    //   50 kHz and 1.5 MHz for maximum resolution
+    //   Dividing 10 MHz by 16 yields 625 KHz
+    // It takes ~15 cycles for a conversion so that is 24us, several orders of magnitude
+    //   faster than it needs to be with an input RC time constant of ~10ms
+    ADC0.CTRLC = ADC_PRESC_DIV16_gc | ADC_REFSEL_VDDREF_gc;
 
     // Small settling delay
     _delay_ms(2);
@@ -285,7 +318,7 @@ static void init_avr(void)
     flash_led(1);	// Startup signal
 
 		// let DFPlayer power up. Could take from 1-5 seconds
-		for(timeout=0; dfplayer_get_status(500) == QUERY_BUSY; timeout++)
+		for(timeout=0; dfplayer_get_status(50) == QUERY_BUSY; timeout++)
 		{
 			// This should be replaced with a watchdog timer function to reset
 			//  the AVR as it does not have a reset instruction per se
@@ -308,7 +341,7 @@ int main(void)
 	// Read PA2 level. This isn't intended to be dynamic, rather a jumper
 	//  or left open - so we read it once only
   uint8_t pa2_high = (PORTA.IN & PIN2_bm) != 0;
-   
+
   // Loop endlessly playing the track when we get the desired transition
   //   There is no noise suppression in software at this time. The hardware has
   //   a time constant of ~10ms on the input which may be sufficient     
@@ -332,16 +365,19 @@ int main(void)
 	    // Send command to play track 1 (command 0x03, params hi/lo = 0x00 0x01)
 	    dfplayer_send_cmd(PLAY_TRACK_CMD, 0x00, 0x01);
 	    
-	    // Query status to see when it's done playing
-			while(dfplayer_get_status(500) == QUERY_PLAYING) {    	
+	    // Query status every 5 seconds to see when it's done playing, flash the
+	    //   LED when requesting status. Polling too frequently
+	    //   inserts bits of static into the sound. At 5 sesconds it seems to fall
+	    //   mostly (but not always) inside some buffering window and is silent
+			while(dfplayer_get_status(50) == QUERY_PLAYING) {    	
 		    flash_led(1);
 	    }			
 		}
 		
-		// Wait 1/10 of a second and try again
+		// Wait 2/10 of a second and try again
 		else {
-		_delay_ms(100);
-		 }
+		_delay_ms(200);
+		}
   }
 	
 	// Should never get here. What does the AVR do?
